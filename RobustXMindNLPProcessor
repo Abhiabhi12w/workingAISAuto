@@ -1,0 +1,326 @@
+package com.xmind.nlp;
+
+import opennlp.tools.tokenize.SimpleTokenizer;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class RobustXMindNLPProcessor {
+    
+    private SimpleTokenizer tokenizer;
+    private Map<String, String> fieldMappings;
+    
+    // Comprehensive patterns for ANY field-value extraction
+    private static final Pattern[] UNIVERSAL_PATTERNS = {
+        
+        // Pattern 1: "X is set to Y" / "X is Y" / "X equals Y"
+        Pattern.compile("(?:the\\s+)?(\\w+(?:\\s+\\w+){0,4})\\s+(?:is\\s+set\\s+to|is\\s+assigned|is\\s+configured\\s+as|is\\s+defined\\s+as|is|equals?)\\s+[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 2: "set X to Y" / "assign X as Y" / "configure X to Y"
+        Pattern.compile("(?:set|assign|configure|change|update|modify)\\s+(\\w+(?:\\s+\\w+){0,3})\\s+(?:to|as|with|=)\\s+[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 3: "X = Y" / "X: Y" / "X -> Y"
+        Pattern.compile("(\\w+(?:\\s+\\w+){0,3})\\s*[=:→>-]+\\s*[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 4: "X status is Y" / "status of X is Y" / "X flag is Y"
+        Pattern.compile("(?:(?:the\\s+)?(\\w+(?:\\s+\\w+)?)\\s+(?:status|flag|indicator|state|type|code|value)\\s+(?:is|=)|(?:status|flag|indicator|state|type|code|value)\\s+of\\s+(\\w+(?:\\s+\\w+)?))\\s+[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 5: "enable X" / "disable X" / "activate X" / "deactivate X"
+        Pattern.compile("(enable|disable|activate|deactivate|turn\\s+on|turn\\s+off)\\s+(\\w+(?:\\s+\\w+){0,3})", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 6: "X becomes Y" / "X changes to Y" / "X transforms into Y"
+        Pattern.compile("(\\w+(?:\\s+\\w+){0,3})\\s+(?:becomes|changes\\s+to|transforms\\s+into|switches\\s+to)\\s+[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+        
+        // Pattern 7: "X has value Y" / "X contains Y" / "X shows Y"
+        Pattern.compile("(\\w+(?:\\s+\\w+){0,3})\\s+(?:has\\s+value|contains|shows|displays|indicates)\\s+[\"']?([^\"'\\s,.;!?]+)[\"']?", Pattern.CASE_INSENSITIVE),
+    };
+    
+    public RobustXMindNLPProcessor(Map<String, String> fieldMappings) {
+        this.fieldMappings = new HashMap<>();
+        
+        // Normalize field mappings to lowercase, no spaces for better matching
+        for (Map.Entry<String, String> entry : fieldMappings.entrySet()) {
+            String normalizedKey = normalizeFieldName(entry.getKey());
+            this.fieldMappings.put(normalizedKey, entry.getValue());
+        }
+        
+        this.tokenizer = SimpleTokenizer.INSTANCE;
+        System.out.println("🤖 Enhanced NLP Processor initialized with " + this.fieldMappings.size() + " field mappings");
+        System.out.println("🔍 Normalized fields: " + this.fieldMappings.keySet());
+    }
+    
+    /**
+     * Extract ALL possible field-value pairs from ANY English text
+     */
+    public Map<String, String> extractFieldValues(String text) {
+        Map<String, String> extractedFields = new HashMap<>();
+        
+        if (text == null || text.trim().isEmpty()) {
+            return extractedFields;
+        }
+        
+        System.out.println("🔍 NLP Processing: " + text);
+        
+        try {
+            // Split into sentences for better processing
+            String[] sentences = splitIntoSentences(text);
+            
+            for (String sentence : sentences) {
+                sentence = sentence.trim();
+                if (!sentence.isEmpty()) {
+                    extractedFields.putAll(processUniversalPatterns(sentence));
+                }
+            }
+            
+            // If no patterns matched, try fallback approaches
+            if (extractedFields.isEmpty()) {
+                extractedFields.putAll(extractWithTokenAnalysis(text));
+                extractedFields.putAll(extractWithProximityAnalysis(text));
+            }
+            
+        } catch (Exception e) {
+            System.err.println("❌ NLP processing error: " + e.getMessage());
+        }
+        
+        return extractedFields;
+    }
+    
+    private String[] splitIntoSentences(String text) {
+        // Enhanced sentence splitting that preserves meaning
+        return text.split("(?<=[.!?])\\s+|(?<=\\.)\\s+(?=[A-Z])|\\s*\\band\\s+|\\s*,\\s+(?=[A-Z])");
+    }
+    
+    private Map<String, String> processUniversalPatterns(String sentence) {
+        Map<String, String> results = new HashMap<>();
+        
+        for (int patternIndex = 0; patternIndex < UNIVERSAL_PATTERNS.length; patternIndex++) {
+            Pattern pattern = UNIVERSAL_PATTERNS[patternIndex];
+            Matcher matcher = pattern.matcher(sentence);
+            
+            while (matcher.find()) {
+                String fieldText = null;
+                String value = null;
+                
+                // Handle different pattern structures
+                if (patternIndex == 4) { // Enable/disable pattern
+                    String action = matcher.group(1).toLowerCase();
+                    fieldText = matcher.group(2);
+                    value = determineActionValue(action);
+                } else if (patternIndex == 3) { // Status pattern with two possible groups
+                    fieldText = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+                    value = matcher.group(3);
+                } else {
+                    // Standard field-value pattern
+                    fieldText = matcher.group(1);
+                    if (matcher.groupCount() >= 2) {
+                        value = matcher.group(2);
+                    }
+                }
+                
+                if (fieldText != null && value != null) {
+                    String dbField = mapToDbField(fieldText.trim());
+                    if (dbField != null) {
+                        value = cleanAndStandardizeValue(value.trim());
+                        if (!value.isEmpty()) {
+                            results.put(dbField, value);
+                            System.out.println("🎯 Pattern " + (patternIndex + 1) + ": '" + fieldText + "' → " + dbField + " = " + value);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return results;
+    }
+    
+    private String determineActionValue(String action) {
+        switch (action.toLowerCase().replaceAll("\\s+", "")) {
+            case "enable":
+            case "activate":
+            case "turnon":
+                return "ON";
+            case "disable":
+            case "deactivate":
+            case "turnoff":
+                return "OFF";
+            default:
+                return action.toUpperCase();
+        }
+    }
+    
+    private Map<String, String> extractWithTokenAnalysis(String text) {
+        Map<String, String> results = new HashMap<>();
+        
+        String[] tokens = tokenizer.tokenize(text);
+        
+        // Look for field keywords followed by potential values within reasonable distance
+        for (int i = 0; i < tokens.length - 1; i++) {
+            String currentToken = tokens[i].toLowerCase();
+            
+            // Check if current token or phrase matches any field mapping
+            for (Map.Entry<String, String> entry : fieldMappings.entrySet()) {
+                String normalizedFieldKey = entry.getKey();
+                String dbField = entry.getValue();
+                
+                if (matchesField(currentToken, normalizedFieldKey)) {
+                    
+                    // Look ahead for a value within next 8 tokens
+                    for (int j = i + 1; j < Math.min(tokens.length, i + 8); j++) {
+                        String potentialValue = tokens[j];
+                        
+                        if (isValidValue(potentialValue)) {
+                            String cleanValue = cleanAndStandardizeValue(potentialValue);
+                            results.put(dbField, cleanValue);
+                            System.out.println("🎯 Token Analysis: " + normalizedFieldKey + " → " + dbField + " = " + cleanValue);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return results;
+    }
+    
+    private Map<String, String> extractWithProximityAnalysis(String text) {
+        Map<String, String> results = new HashMap<>();
+        
+        // Extract all quoted values and nearby field names
+        Pattern quotedPattern = Pattern.compile("[\"']([^\"']+)[\"']");
+        Matcher quoteMatcher = quotedPattern.matcher(text);
+        
+        while (quoteMatcher.find()) {
+            String quotedValue = quoteMatcher.group(1);
+            int quotePosition = quoteMatcher.start();
+            
+            // Look for field names in the 50 characters before the quote
+            int searchStart = Math.max(0, quotePosition - 50);
+            String contextBefore = text.substring(searchStart, quotePosition);
+            
+            String fieldName = findBestFieldMatch(contextBefore);
+            if (fieldName != null) {
+                String dbField = mapToDbField(fieldName);
+                if (dbField != null) {
+                    String cleanValue = cleanAndStandardizeValue(quotedValue);
+                    results.put(dbField, cleanValue);
+                    System.out.println("🎯 Proximity Analysis: " + fieldName + " → " + dbField + " = " + cleanValue);
+                }
+            }
+        }
+        
+        return results;
+    }
+    
+    private boolean matchesField(String token, String normalizedFieldKey) {
+        String normalizedToken = normalizeFieldName(token);
+        return normalizedToken.equals(normalizedFieldKey) || 
+               normalizedToken.contains(normalizedFieldKey) || 
+               normalizedFieldKey.contains(normalizedToken);
+    }
+    
+    private String findBestFieldMatch(String context) {
+        String bestMatch = null;
+        int bestScore = 0;
+        
+        String normalizedContext = normalizeFieldName(context);
+        
+        for (Map.Entry<String, String> entry : fieldMappings.entrySet()) {
+            String normalizedFieldKey = entry.getKey();
+            String dbField = entry.getValue();
+            
+            if (normalizedContext.contains(normalizedFieldKey)) {
+                int score = normalizedFieldKey.length(); // Longer matches score higher
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = dbField;
+                }
+            }
+        }
+        
+        return bestMatch;
+    }
+    
+    private String mapToDbField(String xmindText) {
+        if (xmindText == null || xmindText.trim().isEmpty()) {
+            return null;
+        }
+        
+        String normalizedInput = normalizeFieldName(xmindText);
+        System.out.println("🔍 Mapping field: '" + xmindText + "' normalized to: '" + normalizedInput + "'");
+        
+        // Try exact normalized match first
+        if (fieldMappings.containsKey(normalizedInput)) {
+            String result = fieldMappings.get(normalizedInput);
+            System.out.println("✅ Exact match: '" + xmindText + "' → " + result);
+            return result;
+        }
+        
+        // Try partial match (contains)
+        for (Map.Entry<String, String> entry : fieldMappings.entrySet()) {
+            String normalizedFieldKey = entry.getKey();
+            String dbField = entry.getValue();
+            
+            if (normalizedInput.contains(normalizedFieldKey) || normalizedFieldKey.contains(normalizedInput)) {
+                System.out.println("✅ Partial match: '" + xmindText + "' → " + dbField);
+                return dbField;
+            }
+        }
+        
+        System.out.println("❌ No match found for: '" + xmindText + "'");
+        return null;
+    }
+    
+    private String normalizeFieldName(String fieldName) {
+        return fieldName.toLowerCase()
+                       .replaceAll("[\\s_-]+", "")          // Remove spaces, underscores, hyphens
+                       .replaceAll("[^a-z0-9]", "");        // Remove special characters
+    }
+    
+    private boolean isValidValue(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return false;
+        }
+        
+        String clean = value.replaceAll("[\"',.;!?()\\[\\]{}]", "");
+        
+        // Valid if it's:
+        return clean.matches("^[A-Z]{1,10}$") ||           // Uppercase codes (NY, CA, OFF, ON)
+               clean.matches("^[a-zA-Z]{3,20}$") ||        // Text values (Active, Pending)
+               clean.matches("^\\d+$") ||                  // Numbers (500, 1000)
+               clean.matches("^[A-Z]\\d+$") ||            // Alphanumeric (A4, B1)
+               clean.matches("^\\d+[A-Z]?$") ||           // Numbers with suffix (30D, 500M)
+               clean.length() >= 2;                       // Any reasonable value
+    }
+    
+    private String cleanAndStandardizeValue(String value) {
+        if (value == null) {
+            return "";
+        }
+        
+        String cleaned = value.replaceAll("[\"',.;!?()\\[\\]{}]", "").trim();
+        
+        // Standardize common values
+        cleaned = cleaned.toUpperCase();
+        
+        // Boolean standardization
+        if (cleaned.matches("^(YES|TRUE|ENABLE|ENABLED|ACTIVE|ACTIVATED|ON)$")) {
+            return "Y";
+        } else if (cleaned.matches("^(NO|FALSE|DISABLE|DISABLED|INACTIVE|DEACTIVATED|OFF)$")) {
+            return "N";
+        }
+        
+        // State code standardization
+        Map<String, String> stateCodes = new HashMap<>();
+        stateCodes.put("NEWYORK", "NY");
+        stateCodes.put("CALIFORNIA", "CA");
+        stateCodes.put("FLORIDA", "FL");
+        stateCodes.put("TEXAS", "TX");
+        stateCodes.put("ILLINOIS", "IL");
+        
+        if (stateCodes.containsKey(cleaned)) {
+            return stateCodes.get(cleaned);
+        }
+        
+        return cleaned;
+    }
+}

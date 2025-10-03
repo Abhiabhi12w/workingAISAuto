@@ -1,0 +1,255 @@
+(async () => {
+  // ============================================================
+  // IFRAME TARGETING - rdSearchWindow
+  // ============================================================
+  let doc = document;
+  let targetFrame = null;
+  
+  // Try to find iframe by name first
+  targetFrame = document.querySelector('iframe[name="rdSearchWindow"]');
+  
+  if (targetFrame && targetFrame.contentDocument) {
+    doc = targetFrame.contentDocument;
+    console.log('✓ Found iframe "rdSearchWindow", switched to frame context');
+  } else {
+    console.warn('⚠ iframe "rdSearchWindow" not found or not accessible, trying main document');
+  }
+  
+  // Verify grid exists
+  if (!doc.querySelector('tr[id^="rdDocMover_ctl00__"]')) {
+    alert('Grid not found in iframe "rdSearchWindow".\n\nMake sure:\n1. You\'re on the correct page\n2. The iframe has loaded\n3. You have access to the iframe content');
+    return;
+  }
+
+  // ============================================================
+  // MODE SELECTION
+  // ============================================================
+  const mode = prompt(
+    'Select mode:\n\n' +
+    '1 = AUTOMATIC (script selects bin, processor, and clicks Move)\n' +
+    '2 = MANUAL (script ticks checkboxes only; you pick bin/processor/Move)\n\n' +
+    'Enter 1 or 2:'
+  );
+
+  const isAuto = mode === '1';
+  const isManual = mode === '2';
+
+  if (!isAuto && !isManual) {
+    alert('Invalid selection. Please run again and enter 1 or 2.');
+    return;
+  }
+
+  console.log(`\n=== DocMover Automation ===`);
+  console.log(`Mode: ${isAuto ? 'AUTOMATIC' : 'MANUAL'}`);
+  console.log(`Context: iframe[name="rdSearchWindow"]\n`);
+
+  // ============================================================
+  // CONFIGURATION
+  // ============================================================
+  const WAIT_OPEN = 450;
+  const WAIT_SELECT = 650;
+  const WAIT_AFTER_MOVE = 2500;
+  const BIN_TEXT = 'Medical Expense Review FCC 04';
+  const PROCESSOR_TEXT = 'Ragavendran Gnanasek';
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true }));
+
+  // ============================================================
+  // CHECKBOX HELPERS
+  // ============================================================
+  const checkWithEvents = async (cb) => {
+    if (!cb || cb.disabled) return false;
+    cb.click();
+    await sleep(120);
+    if (!cb.checked) {
+      cb.checked = true;
+      fire(cb, 'input'); fire(cb, 'change'); fire(cb, 'click');
+      await sleep(120);
+    }
+    return cb.checked;
+  };
+
+  const cbIdFromRowIdx = (idx) => 
+    `rdDocMover_ctl00_ctl${String(idx*2+4).padStart(2,'0')}_ClientSelectColumnSelectCheckBox`;
+
+  // ============================================================
+  // STATUS GROUPING (reads td[13] = cells[12])
+  // ============================================================
+  const getStatusGroups = () => {
+    const groups = new Map();
+    doc.querySelectorAll('tr[id^="rdDocMover_ctl00__"]').forEach(tr => {
+      const idx = Number(tr.id.split('__')[1]);
+      if (!Number.isInteger(idx)) return;
+      
+      const status = tr.cells?.[12]?.textContent?.trim() || '';
+      if (!status) return;
+      
+      const cb = doc.getElementById(cbIdFromRowIdx(idx));
+      if (!cb) return;
+      
+      if (!groups.has(status)) groups.set(status, []);
+      groups.get(status).push(cb);
+    });
+    return groups;
+  };
+
+  // ============================================================
+  // DROPDOWN HELPERS (for automatic mode)
+  // ============================================================
+  const getDisplayInputForArrow = (arrowEl) => {
+    if (!arrowEl?.id?.endsWith('_Arrow')) return null;
+    const base = arrowEl.id.replace(/_Arrow$/, '');
+    return doc.getElementById(base + '_Input') || doc.getElementById(base);
+  };
+
+  const openAndSelect = async (arrowSelector, textToPick) => {
+    const arrow = doc.querySelector(arrowSelector);
+    if (!arrow) return false;
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      arrow.click();
+      await sleep(WAIT_OPEN);
+
+      const visibleLis = Array.from(doc.querySelectorAll('li'))
+        .filter(li => li.offsetParent !== null);
+      const target = visibleLis.find(li => li.textContent.trim().includes(textToPick));
+      
+      if (target) {
+        target.click();
+        await sleep(WAIT_SELECT);
+
+        const display = getDisplayInputForArrow(arrow);
+        if (!display || (display.value || display.textContent || '').includes(textToPick)) {
+          return true;
+        }
+      }
+      await sleep(250);
+    }
+    return false;
+  };
+
+  // ============================================================
+  // GRID REFRESH DETECTION
+  // ============================================================
+  const gridSig = () => 
+    Array.from(doc.querySelectorAll('tr[id^="rdDocMover_ctl00__"]'))
+      .map(tr => tr.id).join('|');
+  
+  const waitForGridChange = async (prev, timeout = 20000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      await sleep(300);
+      const now = gridSig();
+      if (now && now !== prev) return true;
+    }
+    return false;
+  };
+
+  // ============================================================
+  // AUTOMATIC MODE
+  // ============================================================
+  const processAutomatic = async (status, checkboxes) => {
+    console.log(`  ✓ Selecting ${checkboxes.length} checkboxes`);
+    for (const cb of checkboxes) {
+      await checkWithEvents(cb);
+      await sleep(90);
+    }
+
+    console.log(`  ✓ Selecting bin: ${BIN_TEXT}`);
+    const binOk = await openAndSelect('#ddlBin_Arrow', BIN_TEXT);
+    if (!binOk) console.warn('  ⚠ Bin selection failed');
+
+    console.log(`  ✓ Selecting processor: ${PROCESSOR_TEXT}`);
+    const procOk = await openAndSelect('#ddlProcessor_Arrow', PROCESSOR_TEXT);
+    if (!procOk) console.warn('  ⚠ Processor selection failed');
+
+    console.log(`  ✓ Clicking Move`);
+    const sigBefore = gridSig();
+    doc.querySelector('#btnMove')?.click();
+    await sleep(600);
+    
+    const changed = await waitForGridChange(sigBefore);
+    if (!changed) console.warn('  ⚠ Grid did not refresh');
+    await sleep(WAIT_AFTER_MOVE);
+  };
+
+  // ============================================================
+  // MANUAL MODE
+  // ============================================================
+  const processManual = async (status, checkboxes) => {
+    console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`  STATUS: "${status}"`);
+    console.log(`  DOCUMENTS SELECTED: ${checkboxes.length}`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+    
+    console.log(`  ✓ Ticking ${checkboxes.length} checkboxes...`);
+    for (const cb of checkboxes) {
+      await checkWithEvents(cb);
+      await sleep(90);
+    }
+    
+    console.log(`\n  ⏸ PAUSED - Checkboxes are now selected.\n`);
+    console.log(`  📋 YOUR TURN:`);
+    console.log(`     1. Select bin from dropdown`);
+    console.log(`     2. Select processor from dropdown`);
+    console.log(`     3. Click the Move button`);
+    console.log(`     4. Wait for the grid to refresh`);
+    console.log(`\n  ⚡ When done, type in console and press Enter:`);
+    console.log(`\n     continueProcessing()\n`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+    
+    await new Promise((resolve, reject) => {
+      window.continueProcessing = () => {
+        console.log(`\n  ✓ Continuing to next batch...\n`);
+        delete window.continueProcessing;
+        resolve();
+      };
+      
+      window.stopProcessing = () => {
+        console.log(`\n  ⛔ Stopped by user\n`);
+        delete window.continueProcessing;
+        delete window.stopProcessing;
+        reject(new Error('User stopped processing'));
+      };
+      
+      console.log(`  💡 TIP: To stop the script, type: stopProcessing()\n`);
+    });
+    
+    await sleep(500);
+  };
+
+  // ============================================================
+  // MAIN LOOP
+  // ============================================================
+  let safety = 0;
+  
+  while (safety++ < 40) {
+    const groups = Array.from(getStatusGroups().entries());
+    if (groups.length === 0) {
+      console.log('✓ No more rows to process');
+      break;
+    }
+    
+    groups.sort((a,b) => b[1].length - a[1].length);
+    const [status, cbs] = groups[0];
+    
+    console.log(`\n[Batch ${safety}] Status: "${status}" (${cbs.length} rows)`);
+    
+    try {
+      if (isAuto) {
+        await processAutomatic(status, cbs);
+      } else {
+        await processManual(status, cbs);
+      }
+    } catch (err) {
+      console.log(`\n⚠ Stopped: ${err.message}`);
+      break;
+    }
+  }
+  
+  console.log('\n=== Done ===');
+  
+  delete window.continueProcessing;
+  delete window.stopProcessing;
+})();

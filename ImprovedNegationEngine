@@ -1,0 +1,55 @@
+package com.xmind;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class ImprovedNegationEngine {
+    
+    public static String negateDecision(String condition) {
+        if (condition == null || condition.trim().isEmpty()) {
+            return condition;
+        }
+        
+        String trimmed = condition.trim();
+        
+        // Handle == and != 
+        if (trimmed.contains("==")) {
+            return trimmed.replace("==", "!=");
+        }
+        if (trimmed.contains("!=")) {
+            return trimmed.replace("!=", "==");
+        }
+        
+        // Handle > and <=
+        if (trimmed.contains(" > ")) {
+            return trimmed.replace(" > ", " <= ");
+        }
+        if (trimmed.contains(" <= ")) {
+            return trimmed.replace(" <= ", " > ");
+        }
+        
+        // Handle "is not" -> "is"
+        if (trimmed.contains(" is not ")) {
+            return trimmed.replace(" is not ", " is ");
+        }
+        
+        // Handle "is" -> "is not" 
+        if (trimmed.contains(" is ")) {
+            return trimmed.replace(" is ", " is not ");
+        }
+        
+        // Handle "has" -> "does not have"
+        if (trimmed.contains(" has ")) {
+            return trimmed.replace(" has ", " does not have ");
+        }
+        
+        // Handle "contains" -> "does not contain"
+        if (trimmed.contains(" contains ")) {
+            return trimmed.replace(" contains ", " does not contain ");
+        }
+        
+        // If nothing matches, wrap in NOT()
+        return "NOT(" + trimmed + ")";
+    }
+}
+

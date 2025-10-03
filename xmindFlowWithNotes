@@ -1,0 +1,1109 @@
+package com.xmind;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.ss.util.WorkbookUtil;
+import com.xmind.nlp.RobustXMindNLPProcessor;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+public class XMindFlowWithNotes {
+
+    private static final String XMIND_FILE_PATH = "C:\\Users\\Ragavendran.Gnanasek\\OneDrive - CCC Intelligent Solutions Inc\\Desktop\\abtest\\xmindtest\\ab32_final.xmind";
+    private static final String OUTPUT_DIRECTORY = "C:\\Users\\Ragavendran.Gnanasek\\OneDrive - CCC Intelligent Solutions Inc\\Desktop\\abtest\\xmindtest\\testQ\\";
+    private static final String CONFIG_FILE_PATH = OUTPUT_DIRECTORY + "field_mapping_config.csv";
+    private static final String TARGET_ROOT_TITLE = "";
+    
+    // Sheet generation controls  
+    private static final boolean GENERATE_FLOWPATHS_SHEET = true;
+    private static final boolean GENERATE_NOTES_SHEET = true;
+    private static final boolean GENERATE_SUMMARY_SHEET = false;
+
+    // Field mapping configuration
+    private static Map<String, FieldMapping> fieldMappings = new HashMap<>();
+    
+    // Enhanced NLP Processor
+    private RobustXMindNLPProcessor robustNlpProcessor;
+    
+    public static void main(String[] args) {
+        try {
+            XMindFlowWithNotes extractor = new XMindFlowWithNotes();
+            
+            extractor.loadFieldMappings();
+            
+            // Debug field mappings
+            extractor.debugFieldMappings();
+            
+            // Initialize enhanced NLP processor
+            extractor.initializeRobustNLP();
+            
+            List<FlowPath> paths = extractor.extractFlowPaths(XMIND_FILE_PATH);
+            if (paths.isEmpty()) {
+                System.err.println("No scenarios extracted.");
+                return;
+            }
+            
+            List<TestScenario> scenarios = extractor.generateTestScenarios(paths);
+            
+            String outputFile = extractor.generateOutputFilename();
+            new File(OUTPUT_DIRECTORY).mkdirs();
+            
+            extractor.writeEnhancedExcel(paths, scenarios, outputFile);
+            
+            System.out.println("\n✅ Extracted " + paths.size() + " flow paths");
+            System.out.println("🎯 Generated " + scenarios.size() + " positive test scenarios");  
+            System.out.println("📄 Output file: " + outputFile);
+            extractor.printSummary(paths, scenarios);
+            
+        } catch (Exception e) {
+            System.err.println("❌ Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private void debugFieldMappings() {
+        System.out.println("\n🔍 DEBUG: Field Mappings Loaded:");
+        for (Map.Entry<String, FieldMapping> entry : fieldMappings.entrySet()) {
+            System.out.println("  Key: '" + entry.getKey() + "' -> Field: '" + entry.getValue().fieldName + "' Default: '" + entry.getValue().defaultValue + "'");
+        }
+        System.out.println("🔍 Total mappings: " + fieldMappings.size());
+    }
+
+    private void initializeRobustNLP() {
+        try {
+            Map<String, String> simpleFieldMappings = new HashMap<>();
+            
+            for (Map.Entry<String, FieldMapping> entry : fieldMappings.entrySet()) {
+                simpleFieldMappings.put(entry.getKey(), entry.getValue().fieldName);
+            }
+            
+            this.robustNlpProcessor = new RobustXMindNLPProcessor(simpleFieldMappings);
+            System.out.println("✅ Enhanced NLP processor initialized successfully");
+            
+        } catch (Exception e) {
+            System.err.println("⚠️ NLP initialization failed: " + e.getMessage());
+            this.robustNlpProcessor = null;
+        }
+    }
+
+    private void loadFieldMappings() {
+        try (BufferedReader br = new BufferedReader(new FileReader(CONFIG_FILE_PATH))) {
+            String line;
+            br.readLine(); // Skip header
+            while ((line = br.readLine()) != null) {
+                String[] parts = splitCsvLine(line);
+                if (parts.length >= 6) {
+                    FieldMapping mapping = new FieldMapping(
+                        parts[0].replace("\"", ""), // xmind_keyword
+                        parts[1].replace("\"", ""), // field_name  
+                        parts[2].replace("\"", ""), // sql_tables
+                        parts[3].replace("\"", ""), // sql_columns
+                        parts[4].replace("\"", ""), // data_type
+                        parts[5].replace("\"", "")  // default_value
+                    );
+                    // Store with normalized key for better matching
+                    String normalizedKey = parts[0].replace("\"", "").toLowerCase();
+                    fieldMappings.put(normalizedKey, mapping);
+                }
+            }
+            System.out.println("📊 Loaded " + fieldMappings.size() + " field mappings from config");
+        } catch (IOException e) {
+            System.err.println("⚠️  Could not load field mappings: " + e.getMessage());
+            createDefaultFieldMappings();
+        }
+    }
+
+    private String[] splitCsvLine(String line) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        
+        for (char c : line.toCharArray()) {
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                tokens.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        tokens.add(current.toString());
+        return tokens.toArray(new String[0]);
+    }
+
+    private List<TestScenario> generateTestScenarios(List<FlowPath> paths) {
+        List<TestScenario> scenarios = new ArrayList<>();
+        int scenarioCount = 0;
+        
+        for (FlowPath path : paths) {
+            // Skip negative scenarios for now
+            if (!path.isPositive()) {
+                System.out.println("⏭️  Skipping negative scenario: " + path.generatePathString());
+                continue;
+            }
+            
+            TestScenario scenario = new TestScenario();
+            scenario.scenarioName = "path" + (++scenarioCount);
+            scenario.flowPath = path;
+            
+            Map<String, String> finalFields = getMacroDefaults();
+            Map<String, String> extractedFields = new HashMap<>();
+            
+            // Extract from both step text AND notes
+            for (int i = 0; i < path.getSteps().size(); i++) {
+                String step = path.getSteps().get(i);
+                if (!isOutcomeOrDescription(step)) {
+                    // Extract from step text
+                    Map<String, String> stepFields = extractFieldsFromCondition(step);
+                    extractedFields.putAll(stepFields);
+                    
+                    // Extract from notes (if available)
+                    if (path.getNotePlain() != null && !path.getNotePlain().isEmpty()) {
+                        Map<String, String> noteFields = extractFieldsFromNotes(path.getNotePlain());
+                        extractedFields.putAll(noteFields);
+                    }
+                }
+            }
+            
+            scenario.fieldValues = mergeFields(finalFields, extractedFields);
+            scenario.sqlQueries = generateSQLQueries(scenario.fieldValues);
+            scenarios.add(scenario);
+        }
+        
+        return scenarios;
+    }
+
+    private Map<String, String> extractFieldsFromCondition(String condition) {
+        Map<String, String> extractedFields = new HashMap<>();
+        
+        if (isOutcomeOrDescription(condition)) {
+            return extractedFields;
+        }
+        
+        // Skip negative conditions for now
+        if (condition.toLowerCase().contains(" not ") || condition.toLowerCase().startsWith("not(")) {
+            return extractedFields;
+        }
+        
+        Pattern pattern = Pattern.compile("(\\w+(?:\\s+\\w+)*)\\s+(is|equals|=)\\s+([\\w,\\s\\-/]+?)(?=\\s+(?:and|or|$)|$)", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(condition);
+        
+        while (matcher.find()) {
+            String fieldText = matcher.group(1).trim().toLowerCase();
+            String value = matcher.group(3).trim();
+            
+            String dbField = convertToDBFieldUsingConfig(fieldText);
+            
+            if (dbField != null) {
+                value = cleanValue(value);
+                
+                if (!value.isEmpty()) {
+                    extractedFields.put(dbField, value);
+                    System.out.println("🎯 Extracted from text: " + dbField + " = " + value + " (from: " + condition + ")");
+                }
+            }
+        }
+        
+        return extractedFields;
+    }
+
+    private Map<String, String> extractFieldsFromNotes(String note) {
+        Map<String, String> extractedFields = new HashMap<>();
+        
+        if (note == null || note.trim().isEmpty()) {
+            return extractedFields;
+        }
+        
+        System.out.println("\n🔍 DEBUG: Processing note: " + note);
+        
+        // Existing technical parsing
+        extractedFields.putAll(parseComparisonExpressions(note));
+        extractedFields.putAll(parseMethodCallExpressions(note));
+        extractedFields.putAll(parseDotNotationExpressions(note));
+        
+        System.out.println("🔍 DEBUG: After technical parsing: " + extractedFields);
+        
+        // NEW: Enhanced NLP-based extraction
+        if (robustNlpProcessor != null) {
+            Map<String, String> nlpExtracted = robustNlpProcessor.extractFieldValues(note);
+            System.out.println("🔍 DEBUG: NLP extracted: " + nlpExtracted);
+            
+            // Merge NLP results with priority (NLP values override existing ones if non-empty)
+            for (Map.Entry<String, String> entry : nlpExtracted.entrySet()) {
+                if (entry.getValue() != null && !entry.getValue().trim().isEmpty()) {
+                    extractedFields.put(entry.getKey(), entry.getValue());
+                    System.out.println("🤖 NLP Override: " + entry.getKey() + " = " + entry.getValue());
+                }
+            }
+        } else {
+            System.out.println("❌ DEBUG: robustNlpProcessor is NULL!");
+        }
+        
+        System.out.println("🔍 DEBUG: Final extracted fields: " + extractedFields);
+        return extractedFields;
+    }
+
+    private Map<String, String> parseComparisonExpressions(String note) {
+        Map<String, String> extracted = new HashMap<>();
+        
+        Pattern[] patterns = {
+            Pattern.compile("(\\w+)\\s*==\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*==\\s*(\\w+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*=\\s*(\\w+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*>\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*<\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*>=\\s*(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\w+)\\s*<=\\s*(\\d+)", Pattern.CASE_INSENSITIVE)
+        };
+        
+        for (Pattern pattern : patterns) {
+            Matcher matcher = pattern.matcher(note);
+            while (matcher.find()) {
+                String technicalField = matcher.group(1);
+                String value = matcher.group(2);
+                
+                String standardField = convertToDBFieldUsingConfig(technicalField);
+                if (standardField != null) {
+                    extracted.put(standardField, cleanValue(value));
+                    System.out.println("🔧 Tech Note: " + technicalField + " → " + standardField + " = " + value);
+                }
+            }
+        }
+        
+        return extracted;
+    }
+
+    private Map<String, String> parseMethodCallExpressions(String note) {
+        Map<String, String> extracted = new HashMap<>();
+        
+        Pattern pattern = Pattern.compile("(\\w+)\\(([^)]+)\\)", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(note);
+        
+        while (matcher.find()) {
+            String methodName = matcher.group(1);
+            String parameters = matcher.group(2);
+            
+            Map<String, String> paramFields = parseComparisonExpressions(parameters);
+            extracted.putAll(paramFields);
+            
+            System.out.println("🔧 Method Call: " + methodName + "(" + parameters + ")");
+        }
+        
+        return extracted;
+    }
+
+    private Map<String, String> parseDotNotationExpressions(String note) {
+        Map<String, String> extracted = new HashMap<>();
+        
+        Pattern pattern = Pattern.compile("\\$\\w+\\.(\\w+)", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(note);
+        
+        while (matcher.find()) {
+            String fieldName = matcher.group(1);
+            String standardField = convertToDBFieldUsingConfig(fieldName);
+            
+            if (standardField != null) {
+                System.out.println("🔧 Dot Notation: " + fieldName + " → " + standardField);
+            }
+        }
+        
+        return extracted;
+    }
+
+    private String convertToDBFieldUsingConfig(String xmindField) {
+        if (xmindField == null || xmindField.trim().isEmpty()) {
+            return null;
+        }
+        
+        String normalizedInput = normalizeFieldForMapping(xmindField);
+        System.out.println("🔍 Converting field: '" + xmindField + "' normalized: '" + normalizedInput + "'");
+        
+        // Try exact match with normalized keys
+        for (Map.Entry<String, FieldMapping> entry : fieldMappings.entrySet()) {
+            String configKey = entry.getKey();
+            String normalizedConfig = normalizeFieldForMapping(configKey);
+            
+            if (normalizedInput.equals(normalizedConfig)) {
+                System.out.println("✅ Config match: '" + configKey + "' -> " + entry.getValue().fieldName);
+                return entry.getValue().fieldName;
+            }
+        }
+        
+        // Try partial match
+        for (Map.Entry<String, FieldMapping> entry : fieldMappings.entrySet()) {
+            String configKey = entry.getKey();
+            String normalizedConfig = normalizeFieldForMapping(configKey);
+            
+            if (normalizedInput.contains(normalizedConfig) || normalizedConfig.contains(normalizedInput)) {
+                System.out.println("✅ Config partial: '" + configKey + "' -> " + entry.getValue().fieldName);
+                return entry.getValue().fieldName;
+            }
+        }
+        
+        // Fallback: return normalized field name
+        String fallback = xmindField.toLowerCase().replace(" ", "_");
+        System.out.println("⚠️ Using fallback mapping: '" + xmindField + "' -> '" + fallback + "'");
+        return fallback;
+    }
+
+    private String normalizeFieldForMapping(String fieldName) {
+        return fieldName.toLowerCase()
+                       .replaceAll("[\\s_-]+", "")
+                       .replaceAll("[^a-z0-9]", "");
+    }
+
+    private boolean isOutcomeOrDescription(String text) {
+        String lower = text.toLowerCase();
+        return lower.contains("fire bundle") ||
+               lower.contains("message_") ||
+               lower.contains("fee schedule") ||
+               lower.contains("treatment state - a") ||
+               lower.contains("outcome") ||
+               lower.contains("rule does not apply") ||
+               lower.contains("alternateoutcome") ||
+               lower.length() > 100;
+    }
+
+    private String cleanValue(String value) {
+        value = value.replaceAll("[\"']", "").trim();
+        
+        if (value.contains(",")) {
+            value = value.split(",")[0].trim();
+        }
+        
+        value = value.split("\\s+and\\s+")[0];
+        value = value.split("\\s+or\\s+")[0];
+        
+        return value;
+    }
+
+    private Map<String, String> mergeFields(Map<String, String> defaults, Map<String, String> extracted) {
+        Map<String, String> merged = new HashMap<>(defaults);
+        
+        for (Map.Entry<String, String> entry : extracted.entrySet()) {
+            if (entry.getValue() != null && !entry.getValue().trim().isEmpty()) {
+                String oldValue = merged.get(entry.getKey());
+                merged.put(entry.getKey(), entry.getValue());
+                System.out.println("🔄 Override: " + entry.getKey() + " = " + entry.getValue() + " (was: " + oldValue + ")");
+            }
+        }
+        
+        return merged;
+    }
+
+    private Map<String, String> getMacroDefaults() {
+        Map<String, String> defaults = new HashMap<>();
+        
+        // Load ALL defaults dynamically from CSV config
+        for (FieldMapping fm : fieldMappings.values()) {
+            defaults.put(fm.fieldName, fm.defaultValue);
+        }
+        
+        // Only override dynamic timestamp fields
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        defaults.put("claim_number", "Claimtest_" + timestamp.substring(timestamp.length() - 5));
+        defaults.put("doc_id", "TESTretest_" + timestamp.substring(timestamp.length() - 5));
+        defaults.put("ais_doc_id", "GC" + timestamp.substring(timestamp.length() - 6));
+        
+        return defaults;
+    }
+
+    private void createDefaultFieldMappings() {
+        System.out.println("⚠️ Creating enhanced field mappings...");
+        
+        // ABP Status - ALL possible variations
+        fieldMappings.put("abp", new FieldMapping(
+            "abp", "abp_status", "GEICO_EDI_RET_CLAIM", "AbpStatus", "VARCHAR", "ON"
+        ));
+        fieldMappings.put("abp status", new FieldMapping(
+            "abp status", "abp_status", "GEICO_EDI_RET_CLAIM", "AbpStatus", "VARCHAR", "ON"
+        ));
+        fieldMappings.put("abpstatus", new FieldMapping(
+            "abpstatus", "abp_status", "GEICO_EDI_RET_CLAIM", "AbpStatus", "VARCHAR", "ON"
+        ));
+        fieldMappings.put("automatic billing protection", new FieldMapping(
+            "automatic billing protection", "abp_status", "GEICO_EDI_RET_CLAIM", "AbpStatus", "VARCHAR", "ON"
+        ));
+        
+        // Treatment State variations
+        fieldMappings.put("treatment state", new FieldMapping(
+            "treatment state", "treatment_state", "GEICO_EDI_CLAIM", "LossState", "VARCHAR", "NY"
+        ));
+        fieldMappings.put("treatmentstate", new FieldMapping(
+            "treatmentstate", "treatment_state", "GEICO_EDI_CLAIM", "LossState", "VARCHAR", "NY"
+        ));
+        
+        // Risk State variations
+        fieldMappings.put("risk state", new FieldMapping(
+            "risk state", "risk_state", "GEICO_EDI_CLAIM", "RiskState", "VARCHAR", ""
+        ));
+        fieldMappings.put("riskstate", new FieldMapping(
+            "riskstate", "risk_state", "GEICO_EDI_CLAIM", "RiskState", "VARCHAR", ""
+        ));
+        
+        // Adjuster FCC variations
+        fieldMappings.put("adjuster fcc", new FieldMapping(
+            "adjuster fcc", "adjuster_fcc", "GEICO_EDI_CLAIM", "FCC", "VARCHAR", "02"
+        ));
+        fieldMappings.put("adjusterfcc", new FieldMapping(
+            "adjusterfcc", "adjuster_fcc", "GEICO_EDI_CLAIM", "FCC", "VARCHAR", "02"
+        ));
+        
+        // No Show variations
+        fieldMappings.put("no show", new FieldMapping(
+            "no show", "no_show_ind", "GEICO_EDI_RET_CLAIM", "NoShowInd", "VARCHAR", "N"
+        ));
+        fieldMappings.put("noshow", new FieldMapping(
+            "noshow", "no_show_ind", "GEICO_EDI_RET_CLAIM", "NoShowInd", "VARCHAR", "N"
+        ));
+        
+        System.out.println("✅ Created " + fieldMappings.size() + " enhanced field mappings");
+    }
+
+    // ALL your existing SQL generation methods remain the same...
+    
+    private List<String> generateSQLQueries(Map<String, String> fieldValues) {
+        List<String> queries = new ArrayList<>();
+        
+        queries.add(generateDocInfoFeedQuery(fieldValues));
+        queries.add(generateVerifyDocQuery(fieldValues)); 
+        queries.add(generateEDIClaimQuery(fieldValues));
+        queries.add(generateEDIIPQuery(fieldValues));
+        queries.add(generateEDIProviderQuery(fieldValues));
+        queries.add(generateLoadSP1Query(fieldValues));
+        queries.add(generateLoadSP2Query(fieldValues));
+        queries.add(generateLoadSP3Query(fieldValues));
+        queries.add(generateRETClaimQuery(fieldValues));
+        queries.add(generateRETIPQuery(fieldValues));
+        queries.add(generateRETProviderQuery(fieldValues));
+        queries.add(generateRETIMEInfoQuery(fieldValues));
+        queries.add(generateRETMedExpQuery(fieldValues));
+        queries.add(generateLoadClaimInfoSPQuery(fieldValues));
+        
+        return queries;
+    }
+
+    // SQL Query Generation Methods (keep all your existing methods exactly the same)
+    private String generateDocInfoFeedQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 1: Feed Table-1\n" +
+            "INSERT INTO RP_Feed..GEICO_DocInfo_Feed(GeicoLogicalDocID, ClaimNumber, Category, DateOfReceipt, BatchName, FCC, AdjusterComments, DocumentSource, adjusterFCC, sectionCode)\n" +
+            "SELECT '%s', '%s', '%s', '%s', '%s', '%s', %s, '%s', '%s', '%s'",
+            v.get("doc_id"), v.get("claim_number"), v.get("category"), v.get("date_receipt"),
+            v.get("batch_name"), v.get("fcc"), v.get("adj_comments"), v.get("doc_source"),
+            v.get("adjuster_fcc"), v.get("section_code")
+        );
+    }
+
+    private String generateVerifyDocQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 2: Verifying whether Batch job created the doc id\n" +
+            "SELECT * FROM RP_FEED..GEICO_DOC_KEY\nWHERE Claim_Number LIKE '%s'",
+            v.get("claim_number")
+        );
+    }
+
+    private String generateEDIClaimQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 3: Feed Table-2\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_CLAIM(clm_nbr, ClaimHandlingSystem, DOL, FCC, clmHandlingInd, ReqIndicator, CompanyCode, LossState, RiskState)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+            v.get("claim_number"), v.get("claim_handling_system"), v.get("date_of_loss"),
+            v.get("fcc"), v.get("claim_handling_ind"), v.get("req_indicator"),
+            v.get("company_code"), v.get("treatment_state"), v.get("risk_state")
+        );
+    }
+
+    private String generateEDIIPQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 4: Feed Table-3\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_IP(clm_nbr, IPNumber, FName, LName, DOB, MedExpoIndicator, Gender)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+            v.get("claim_number"), v.get("ip_number"), v.get("ip_fname"), v.get("ip_lname"),
+            v.get("date_of_birth"), v.get("medexpo_indicator"), v.get("gender")
+        );
+    }
+
+    private String generateEDIProviderQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 5: Feed Table-4\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_PROVIDER(clm_nbr, IPNumber, ProviderID, TinTypeIndicator, TIN, Facility, Address1, City, State, Zip, POBOX)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %s)",
+            v.get("claim_number"), v.get("ip_number"), v.get("provider_id"), v.get("tin_type"),
+            v.get("tin"), v.get("facility_name"), v.get("address1"), v.get("city"),
+            v.get("treatment_state"), v.get("zip"), "NULL"
+        );
+    }
+
+    private String generateLoadSP1Query(Map<String, String> v) {
+        return String.format(
+            "----STEP 6: RUN LOAD SP\n" +
+            "EXEC RP_FEED..GEICO_LOADDATACAPTUEINFO '%s', ''",
+            v.get("claim_number")
+        );
+    }
+
+    private String generateLoadSP2Query(Map<String, String> v) {
+        return String.format(
+            "----STEP 7: RUN LOAD SP\n" +
+            "EXEC geico_rp_prod..geico_getbilldata '%s', 'A4'",
+            v.get("ais_doc_id")
+        );
+    }
+
+    private String generateLoadSP3Query(Map<String, String> v) {
+        return String.format(
+            "EXEC geico_Workflow..geico_movefeeddocs '%s', 'A4'",
+            v.get("ais_doc_id")
+        );
+    }
+
+    private String generateRETClaimQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 8:\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_RET_CLAIM(AISDocID, BillID, CompanyCode, PolicyHolderName, PolicyNumber, PolicyType, ClaimNumber, BillStatus, DateOfInjury, DateFinalVerRec, DateFinalVerReq, AdjFName, AdjLName, AdjPhone, AdjExt, AdjFCC, LossSt, RiskSt, FCC, DOL, AbpStatus, fpmEligibilityStatus, totalAmountofBenefitsRem, ImeDenialSpecInd, ExhaustedInd, NoShowInd, ImeDenialInd, IpNotEligibleInd, securedClaimInd, ConvertedClaimInd)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', %s, %s, %s, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+            v.get("ais_doc_id"), v.get("doc_id"), v.get("company_code"), v.get("policyholder_name"),
+            v.get("policy_number"), v.get("policy_type"), v.get("claim_number"), v.get("bill_status"),
+            v.get("date_of_injury"), v.get("date_final_ver_rec"), v.get("date_final_ver_req"),
+            v.get("adj_fname"), v.get("adj_lname"), v.get("adj_phone"), v.get("adj_ext"),
+            v.get("adjuster_fcc"), v.get("treatment_state"), v.get("risk_state"),
+            v.get("fcc"), v.get("date_of_loss"), v.get("abp_status"), v.get("fmp_eligibility"), v.get("total_benefits_rem"),
+            v.get("ime_denial_spec_ind"), v.get("exhausted_ind"), v.get("no_show_ind"),
+            v.get("ime_denial_ind"), v.get("ip_not_eligible_ind"), v.get("secured_claim_ind"),
+            v.get("converted_claim_ind")
+        );
+    }
+
+    private String generateRETIPQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 9:\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_RET_IP(AISDocID, IPNum, FName, LName, DOB, Address1, City, State, Zip, Gender, FPMEligibilityStatus, totalAmountOfBenefitsRemaining, EmgMedCondInd, AbpReserveLineType)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+            v.get("ais_doc_id"), v.get("ip_number"), v.get("ip_fname"), v.get("ip_lname"),
+            v.get("date_of_birth"), v.get("address1"), v.get("city"), v.get("treatment_state"),
+            v.get("zip"), v.get("gender"), v.get("fmp_eligibility"), v.get("total_benefits_rem_ip"),
+            v.get("emg_med_cond_ind"), v.get("abp_reserve_line_type")
+        );
+    }
+
+    private String generateRETProviderQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 10:\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_RET_Provider(AISDocID, ProviderID, Specialty, TIN, TINTypeInd, FacilityName, ProvAddress1, ProvCity, ProvState, ProvZip, AOB, TreatmentZip, CassVerified)\n" +
+            "VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
+            v.get("ais_doc_id"), v.get("provider_id"), v.get("specialty"), v.get("tin"),
+            v.get("tin_type"), v.get("facility_name"), v.get("address1"), v.get("city"),
+            v.get("treatment_state"), v.get("zip"), v.get("aob"), v.get("treatment_zip"),
+            v.get("cass_verified")
+        );
+    }
+
+    private String generateRETIMEInfoQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 11:\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_RET_IMEInfo(Claim_RowID, AISDocID, IMESpecialty, IMEDenialDate, IMENoShow, AtlasIMESpecialty)\n" +
+            "SELECT RC.RowID, '%s', '%s', '%s', '%s', '%s' FROM rp_feed.dbo.GEICO_EDI_RET_CLAIM RC WHERE AISDocID = '%s' AND Status = 1",
+            v.get("ais_doc_id"), v.get("ime_specialty"), v.get("ime_denial_date"),
+            v.get("ime_no_show"), v.get("atlas_ime_specialty"), v.get("ais_doc_id")
+        );
+    }
+
+    private String generateRETMedExpQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 12:\n" +
+            "INSERT INTO RP_Feed.dbo.GEICO_EDI_RET_MEDEXP(Claim_RowID, AISDocID, MedExposure)\n" +
+            "SELECT RC.RowID, '%s', '%s' FROM rp_feed.dbo.GEICO_EDI_RET_CLAIM RC WHERE AISDocID = '%s' AND Status = 1",
+            v.get("ais_doc_id"), v.get("med_exposure"), v.get("ais_doc_id")
+        );
+    }
+
+    private String generateLoadClaimInfoSPQuery(Map<String, String> v) {
+        return String.format(
+            "----STEP 13:\n" +
+            "EXEC RP_FEED.DBO.GEICO_LOADCLAIMINFO '%s'",
+            v.get("ais_doc_id")
+        );
+    }
+
+    // ALL your existing Excel writing methods remain exactly the same...
+    
+    public void writeEnhancedExcel(List<FlowPath> paths, List<TestScenario> scenarios, String outputFile) throws IOException {
+        Workbook wb = new XSSFWorkbook();
+        
+        if (GENERATE_FLOWPATHS_SHEET) {
+            writeFlowPathsSheet(wb, paths);
+        }
+        
+        if (GENERATE_SUMMARY_SHEET) {
+            writeScenariosSheet(wb, scenarios);
+        }
+        
+        // Create individual sheets for each positive scenario
+        for (TestScenario scenario : scenarios) {
+            writeScenarioSheet(wb, scenario);
+        }
+        
+        if (GENERATE_NOTES_SHEET) {
+            writeNotesSheet(wb, paths);
+        }
+
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) { 
+            wb.write(fos); 
+        }
+        wb.close();
+    }
+
+    private String getUniqueSheetName(Workbook workbook, String baseName) {
+        String safeName = WorkbookUtil.createSafeSheetName(baseName);
+        String uniqueName = safeName;
+        int counter = 1;
+        
+        while (workbook.getSheet(uniqueName) != null) {
+            String suffix = "_" + counter;
+            int maxLength = 31 - suffix.length();
+            
+            if (safeName.length() > maxLength) {
+                uniqueName = safeName.substring(0, maxLength) + suffix;
+            } else {
+                uniqueName = safeName + suffix;
+            }
+            counter++;
+        }
+        
+        return uniqueName;
+    }
+
+    private void writeScenarioSheet(Workbook wb, TestScenario scenario) {
+        String uniqueSheetName = getUniqueSheetName(wb, scenario.scenarioName);
+        Sheet sheet = wb.createSheet(uniqueSheetName);
+        
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true);
+        headerFont.setFontHeightInPoints((short) 12);
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.LIGHT_BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        
+        CellStyle queryStyle = wb.createCellStyle();
+        queryStyle.setWrapText(true);
+        queryStyle.setVerticalAlignment(VerticalAlignment.TOP);
+        
+        Row titleRow = sheet.createRow(0);
+        Cell titleCell = titleRow.createCell(0);
+        titleCell.setCellValue("Scenario: " + scenario.scenarioName);
+        titleCell.setCellStyle(headerStyle);
+        
+        Row fieldsHeaderRow = sheet.createRow(2);
+        fieldsHeaderRow.createCell(0).setCellValue("Field");
+        fieldsHeaderRow.createCell(1).setCellValue("Value");
+        fieldsHeaderRow.getCell(0).setCellStyle(headerStyle);
+        fieldsHeaderRow.getCell(1).setCellStyle(headerStyle);
+        
+        int rowNum = 3;
+        String[] keyFields = {"treatment_state", "risk_state", "adjuster_fcc", "claim_number", "provider_id", "abp_status"};
+        for (String field : keyFields) {
+            String value = scenario.fieldValues.get(field);
+            if (value != null) {
+                Row fieldRow = sheet.createRow(rowNum++);
+                fieldRow.createCell(0).setCellValue(field);
+                fieldRow.createCell(1).setCellValue(value);
+            }
+        }
+        
+        rowNum += 2;
+        
+        Row sqlHeaderRow = sheet.createRow(rowNum++);
+        sqlHeaderRow.createCell(0).setCellValue("Step");
+        sqlHeaderRow.createCell(1).setCellValue("SQL Query");
+        sqlHeaderRow.getCell(0).setCellStyle(headerStyle);
+        sqlHeaderRow.getCell(1).setCellStyle(headerStyle);
+        
+        for (int i = 0; i < scenario.sqlQueries.size(); i++) {
+            Row queryRow = sheet.createRow(rowNum++);
+            
+            Cell stepCell = queryRow.createCell(0);
+            stepCell.setCellValue("STEP " + (i + 1));
+            
+            Cell queryCell = queryRow.createCell(1);
+            queryCell.setCellValue(scenario.sqlQueries.get(i));
+            queryCell.setCellStyle(queryStyle);
+            
+            queryRow.setHeightInPoints(60);
+        }
+        
+        sheet.autoSizeColumn(0);
+        sheet.setColumnWidth(1, 25000);
+        
+        System.out.println("✅ Created sheet: " + uniqueSheetName + " (from: " + scenario.scenarioName + ")");
+    }
+
+    private void writeScenariosSheet(Workbook wb, List<TestScenario> scenarios) {
+        Sheet sheet = wb.createSheet("Test_Scenarios_Summary");
+        
+        Row headerRow = sheet.createRow(0);
+        String[] headers = {"Scenario_Name", "Flow_Path", "Treatment_State", "Risk_State", "Adjuster_FCC", "ABP_Status",
+                           "Total_Queries", "Actual_Sheet_Name"};
+        for (int i = 0; i < headers.length; i++) {
+            headerRow.createCell(i).setCellValue(headers[i]);
+        }
+        
+        int rowNum = 1;
+        for (TestScenario scenario : scenarios) {
+            Row row = sheet.createRow(rowNum++);
+            row.createCell(0).setCellValue(scenario.scenarioName);
+            row.createCell(1).setCellValue(scenario.flowPath.generatePathString());
+            row.createCell(2).setCellValue(scenario.fieldValues.get("treatment_state"));
+            row.createCell(3).setCellValue(scenario.fieldValues.get("risk_state"));
+            row.createCell(4).setCellValue(scenario.fieldValues.get("adjuster_fcc"));
+            row.createCell(5).setCellValue(scenario.fieldValues.get("abp_status")); // NEW: Show ABP Status
+            row.createCell(6).setCellValue(scenario.sqlQueries.size());
+            
+            String actualSheetName = getUniqueSheetName(wb, scenario.scenarioName);
+            row.createCell(7).setCellValue(actualSheetName);
+        }
+        
+        for (int i = 0; i < headers.length; i++) {
+            sheet.autoSizeColumn(i);
+        }
+    }
+    
+    public static class TestScenario {
+        public String scenarioName;
+        public FlowPath flowPath;
+        public Map<String, String> fieldValues;
+        public List<String> sqlQueries;
+    }
+
+    public static class FieldMapping {
+        public String xmindKeyword;
+        public String fieldName;
+        public String sqlTables;
+        public String sqlColumns;
+        public String dataType;
+        public String defaultValue;
+
+        public FieldMapping(String xmindKeyword, String fieldName, String sqlTables, String sqlColumns, String dataType, String defaultValue) {
+            this.xmindKeyword = xmindKeyword;
+            this.fieldName = fieldName;
+            this.sqlTables = sqlTables;
+            this.sqlColumns = sqlColumns;
+            this.dataType = dataType;
+            this.defaultValue = defaultValue;
+        }
+    }
+
+    public void printSummary(List<FlowPath> paths, List<TestScenario> scenarios) {
+        long positive = paths.stream().filter(FlowPath::isPositive).count();
+        long negative = paths.size() - positive;
+        
+        System.out.println("\n📊 Generation Summary:");
+        System.out.println("Total Paths: " + paths.size());
+        System.out.println("Positive: " + positive + ", Negative: " + negative + " (skipped)");
+        System.out.println("Test Scenarios Generated: " + scenarios.size());
+        System.out.println("SQL Queries Generated: " + scenarios.stream().mapToInt(s -> s.sqlQueries.size()).sum());
+    }
+
+    public static class FlowPath {
+        private final List<String> steps;
+        private final boolean isPositive;
+        private final int negatedIdx;
+        private final List<Character> pathChoices;
+        private final String flowName;
+        private final String notePlain;
+
+        public FlowPath(List<String> steps, boolean isPositive, int negatedIdx,
+                        List<Character> pathChoices, String flowName, String notePlain) {
+            this.steps = new ArrayList<>(steps);
+            this.isPositive = isPositive;
+            this.negatedIdx = negatedIdx;
+            this.pathChoices = new ArrayList<>(pathChoices);
+            this.flowName = flowName;
+            this.notePlain = notePlain;
+        }
+        public List<String> getSteps() { return steps; }
+        public boolean isPositive() { return isPositive; }
+        public String getOutcome() { return isPositive ? "Positive" : "Negative"; }
+        public String generatePathString() {
+            StringBuilder sb = new StringBuilder();
+            for (char c : pathChoices) sb.append(c);
+            return sb.toString();
+        }
+        public int getNegatedIdx() { return negatedIdx; }
+        public String getFlowName() { return flowName; }
+        public String getNotePlain() { return notePlain; }
+    }
+
+    public List<FlowPath> extractFlowPaths(String xmindFilePath) throws IOException {
+        String contentJson = extractContentJson(xmindFilePath);
+        List<FlowPath> allPaths = new ArrayList<>();
+        JSONArray rootArray = new JSONArray(contentJson);
+        
+        for (int i = 0; i < rootArray.length(); i++) {
+            JSONObject sheet = rootArray.getJSONObject(i);
+            if (sheet.has("rootTopic")) {
+                JSONObject root = sheet.getJSONObject("rootTopic");
+                String rootTitle = root.optString("title", "");
+                if (TARGET_ROOT_TITLE.isEmpty()) {
+                    traverseAndExtractPaths(root, new ArrayList<>(), new ArrayList<>(),
+                        allPaths, null, -1, -1, rootTitle);
+                    break;
+                } else if (rootTitle.equalsIgnoreCase(TARGET_ROOT_TITLE)) {
+                    traverseAndExtractPaths(root, new ArrayList<>(), new ArrayList<>(),
+                        allPaths, null, -1, -1, rootTitle);
+                    break;
+                }
+            }
+        }
+        return allPaths;
+    }
+
+    private String extractContentJson(String xmindFilePath) throws IOException {
+        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(xmindFilePath))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                if ("content.json".equals(entry.getName())) {
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    byte[] buffer = new byte[1024];
+                    int len;
+                    while ((len = zis.read(buffer)) > 0) baos.write(buffer, 0, len);
+                    return baos.toString(StandardCharsets.UTF_8);
+                }
+            }
+        }
+        throw new IOException("content.json not found in XMind file");
+    }
+
+    private void traverseAndExtractPaths(JSONObject node, List<String> currentPath, List<Character> pathChoices,
+                                         List<FlowPath> allPaths, String parentDecision, int childIdx, int negatedIdx, String flowName) {
+        String title = node.optString("title", "");
+        JSONArray attached = null;
+        if (node.has("children")) {
+            JSONObject children = node.getJSONObject("children");
+            if (children.has("attached")) {
+                attached = children.getJSONArray("attached");
+            }
+        }
+        boolean isLeaf = (attached == null || attached.length() == 0);
+        List<String> newPath = new ArrayList<>(currentPath);
+        int newNegatedIdx = negatedIdx;
+        
+        if (currentPath.isEmpty() && !title.isEmpty()) {
+            newPath.add(title);
+        } else if (childIdx == 0 && !isAltOutcomeNode(title)) { 
+            newPath.add(title); 
+        } else if (isAltOutcomeNode(title)) {
+            if (!newPath.isEmpty() && parentDecision != null) {
+                newPath.set(newPath.size() - 1, negateDecision(parentDecision));
+                newNegatedIdx = newPath.size() - 1;
+            }
+            newPath.add(title);
+        } else if (childIdx > 0 && parentDecision != null && !parentDecision.isEmpty() && !newPath.isEmpty()) {
+            String negatedCondition = negateDecision(parentDecision);
+            newPath.set(newPath.size() - 1, negatedCondition);
+            newNegatedIdx = newPath.size() - 1;
+            if (!title.isEmpty()) {
+                newPath.add(title);
+            }
+        } else if (!title.isEmpty()) { 
+            newPath.add(title); 
+        }
+
+        if (isLeaf) {
+            boolean isPositive = isPositiveOutcome(title);
+            String notePlain = extractNotePlain(node);
+            allPaths.add(new FlowPath(newPath, isPositive, newNegatedIdx, pathChoices, flowName, notePlain));
+            return;
+        }
+        
+        for (int i = 0; i < attached.length(); i++) {
+            JSONObject child = attached.getJSONObject(i);
+            List<Character> newChoices = new ArrayList<>(pathChoices);
+            newChoices.add(i == 0 ? 'T' : 'F');
+            traverseAndExtractPaths(child, newPath, newChoices, allPaths, title, i, newNegatedIdx, flowName);
+        }
+    }
+
+    private String extractNotePlain(JSONObject node) {
+        if (node.has("notes")) {
+            Object noteObj = node.get("notes");
+            if (noteObj instanceof JSONObject) {
+                JSONObject n = (JSONObject) noteObj;
+                if (n.has("plain")) {
+                    Object plainObj = n.get("plain");
+                    if (plainObj instanceof JSONObject) {
+                        JSONObject plainJson = (JSONObject) plainObj;
+                        return plainJson.optString("content", "");
+                    } else if (plainObj instanceof String) {
+                        return (String) plainObj;
+                    }
+                } else if (n.has("content")) {
+                    return n.optString("content", "");
+                }
+            }
+        }
+        return "";
+    }
+
+    private boolean isAltOutcomeNode(String title) {
+        String lower = title.toLowerCase();
+        return lower.contains("alt outcome") || lower.contains("alternateoutcome") ||
+               lower.contains("does not apply") || lower.contains("rule does not apply") || lower.contains("otherwise");
+    }
+    
+    private String negateDecision(String s) {
+        if (s == null || s.trim().isEmpty()) return s;
+        String trimmed = s.trim();
+        
+        if (trimmed.contains("==")) return trimmed.replace("==", "!=");
+        if (trimmed.contains("!=")) return trimmed.replace("!=", "==");
+        if (trimmed.contains(" > ")) return trimmed.replace(" > ", " <= ");
+        if (trimmed.contains(" >= ")) return trimmed.replace(" >= ", " < ");
+        if (trimmed.contains(" < ")) return trimmed.replace(" < ", " >= ");
+        if (trimmed.contains(" <= ")) return trimmed.replace(" <= ", " > ");
+        
+        if (trimmed.contains(" is not ")) return trimmed.replace(" is not ", " is ");
+        if (trimmed.contains(" does not have ")) return trimmed.replace(" does not have ", " has ");
+        if (trimmed.contains(" does not contain ")) return trimmed.replace(" does not contain ", " contains ");
+        
+        if (trimmed.contains(" is ")) return trimmed.replace(" is ", " is not ");
+        if (trimmed.contains(" has ")) return trimmed.replace(" has ", " does not have ");
+        if (trimmed.contains(" contains ")) return trimmed.replace(" contains ", " does not contain ");
+        
+        return "NOT(" + trimmed + ")";
+    }
+    
+    private boolean isPositiveOutcome(String nodeTitle) {
+        String lower = nodeTitle.toLowerCase();
+        if (lower.contains("fire bundle") || lower.contains("message_"))
+            return true;
+        if (lower.contains("alt outcome") || lower.contains("alternateoutcome")
+                || lower.contains("rule does not apply") || lower.contains("does not apply"))
+            return false;
+        return true;
+    }
+
+    private void writeFlowPathsSheet(Workbook wb, List<FlowPath> paths) {
+        Sheet sheet = wb.createSheet("FlowPaths");
+        
+        CellStyle headerStyle = wb.createCellStyle();
+        Font headerFont = wb.createFont();
+        headerFont.setBold(true); 
+        headerStyle.setFont(headerFont);
+        headerStyle.setFillForegroundColor(IndexedColors.LIGHT_CORNFLOWER_BLUE.getIndex());
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle positiveStyle = wb.createCellStyle();
+        positiveStyle.setFillForegroundColor(IndexedColors.LIGHT_GREEN.getIndex());
+        positiveStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        CellStyle negativeStyle = wb.createCellStyle();
+        negativeStyle.setFillForegroundColor(IndexedColors.ROSE.getIndex());
+        negativeStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+
+        int maxSteps = paths.stream().mapToInt(p -> p.getSteps().size()).max().orElse(0);
+
+        Row headerRow = sheet.createRow(0);
+        int col = 0;
+        for (int i = 1; i <= maxSteps; i++) {
+            Cell cell = headerRow.createCell(col++);
+            cell.setCellValue("Step_" + i);
+            cell.setCellStyle(headerStyle);
+        }
+        Cell flowCell = headerRow.createCell(col++);
+        flowCell.setCellValue("FlowName");
+        flowCell.setCellStyle(headerStyle);
+        Cell outcomeCell = headerRow.createCell(col++);
+        outcomeCell.setCellValue("Outcome");
+        outcomeCell.setCellStyle(headerStyle);
+        Cell pathStrCell = headerRow.createCell(col++);
+        pathStrCell.setCellValue("Path_String");
+        pathStrCell.setCellStyle(headerStyle);
+        Cell genAtCell = headerRow.createCell(col++);
+        genAtCell.setCellValue("Generated_At");
+        genAtCell.setCellStyle(headerStyle);
+
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm"));
+        int rowNum = 1;
+        for (FlowPath path : paths) {
+            Row row = sheet.createRow(rowNum++);
+            col = 0;
+            CellStyle rowStyle = path.isPositive() ? positiveStyle : negativeStyle;
+            
+            for (int i = 0; i < maxSteps; i++) {
+                Cell cell = row.createCell(col++);
+                String value = i < path.getSteps().size() ? path.getSteps().get(i) : "";
+                cell.setCellValue(value);
+                cell.setCellStyle(rowStyle);
+            }
+            Cell flowc = row.createCell(col++);
+            flowc.setCellValue(path.getFlowName());
+            flowc.setCellStyle(rowStyle);
+            Cell oc = row.createCell(col++);
+            oc.setCellValue(path.getOutcome());
+            oc.setCellStyle(rowStyle);
+            Cell pc = row.createCell(col++);
+            pc.setCellValue(path.generatePathString());
+            pc.setCellStyle(rowStyle);
+            Cell gc = row.createCell(col++);
+            gc.setCellValue(timestamp);
+            gc.setCellStyle(rowStyle);
+        }
+        for (col = 0; col < maxSteps + 5; col++) sheet.autoSizeColumn(col);
+    }
+
+    public void writeNotesSheet(Workbook wb, List<FlowPath> paths) {
+        Sheet notesSheet = wb.createSheet("Notes");
+        CellStyle hdr = wb.createCellStyle();
+        Font f = wb.createFont();
+        f.setBold(true); 
+        hdr.setFont(f);
+
+        Row header = notesSheet.createRow(0);
+        header.createCell(0).setCellValue("XmindFlow");
+        header.getCell(0).setCellStyle(hdr);
+        header.createCell(1).setCellValue("XmindNotes");
+        header.getCell(1).setCellStyle(hdr);
+        header.createCell(2).setCellValue("Path");
+        header.getCell(2).setCellStyle(hdr);
+
+        CellStyle wrapStyle = wb.createCellStyle();
+        wrapStyle.setWrapText(true);
+        wrapStyle.setVerticalAlignment(VerticalAlignment.TOP);
+
+        int rowIdx = 1;
+        for (FlowPath p : paths) {
+            if (p.isPositive() && p.getNotePlain() != null && !p.getNotePlain().isEmpty()) {
+                Row r = notesSheet.createRow(rowIdx++);
+                r.setHeightInPoints(12.5f);
+                r.createCell(0).setCellValue(p.getFlowName());
+                Cell noteCell = r.createCell(1);
+                noteCell.setCellValue(p.getNotePlain());
+                noteCell.setCellStyle(wrapStyle);
+                r.createCell(2).setCellValue(p.generatePathString());
+            }
+        }
+        notesSheet.setColumnWidth(1, (int) (56.89 * 256));
+        notesSheet.autoSizeColumn(0);
+        notesSheet.autoSizeColumn(2);
+    }
+
+    private String generateOutputFilename() {
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String baseName = new File(XMIND_FILE_PATH).getName().replace(".xmind", "");
+        return OUTPUT_DIRECTORY + baseName + "_scenarios_" + timestamp + ".xlsx";
+    }
+}
